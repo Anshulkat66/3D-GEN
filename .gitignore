@@ -1,17 +1,48 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Environments (The heavy Anaconda stuff)
-.conda/
-env/
-venv/
-.env
-
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
 # Operating system files
 Thumbs.db
 .DS_Store
+
+# --- DATA & HEAVY FILES ---
+# This ignores your 3D datasets so they don't crash GitHub
+data/
+temp/
+*.obj
+*.stl
+*.ply
+*.zip
+*.tar.gz
+
+# --- PYTHON JUNK ---
+# These are files your computer creates to run Python faster
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- ENVIRONMENTS ---
+# This prevents your entire Anaconda environment from being uploaded
+.conda/
+.env
+venv/
+env/
+ENV/
+
+# --- IDE & SYSTEM ---
+# Settings specific to your VS Code or Windows
+.vscode/
+.history/
+Thumbs.db
+.DS_Store
+
+# --- MODEL WEIGHTS ---
+# If you train a model, don't upload the large .pth or .h5 files
+*.pth
+*.h5
+*.ckpt
+
+#data folder ignore
+data/
