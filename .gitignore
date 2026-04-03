@@ -1,0 +1,48 @@
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Operating system files
+Thumbs.db
+.DS_Store
+
+# --- DATA & HEAVY FILES ---
+# Keep large training assets out of Git
+3D-GEN/image/
+3D-GEN/eeg_of_subjects/
+3D-GEN/phase1_output/
+data/
+temp/
+*.obj
+*.stl
+*.ply
+*.zip
+*.tar.gz
+
+# --- PYTHON JUNK ---
+# These are files your computer creates to run Python faster
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- ENVIRONMENTS ---
+# This prevents your entire Anaconda environment from being uploaded
+.conda/
+.env
+venv/
+env/
+ENV/
+
+# --- IDE & SYSTEM ---
+# Settings specific to your VS Code or Windows
+.vscode/
+.history/
+Thumbs.db
+.DS_Store
+
+# --- MODEL WEIGHTS ---
+# If you train a model, don't upload the large .pth or .h5 files
+*.pth
+*.h5
+*.ckpt
