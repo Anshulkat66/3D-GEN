@@ -16,3 +16,22 @@ diffusers==0.30.3
 accelerate==0.33.0
 safetensors==0.4.4
 open_clip_torch==2.26.1
+
+# torch==2.4.1
+# torchvision==0.19.1
+
+# numpy==1.26.4
+# scipy==1.13.1
+# pandas==2.2.2
+
+# scikit-learn==1.5.1
+# matplotlib==3.9.1
+
+# tqdm==4.66.5
+# einops==0.8.0
+
+# pillow==10.4.0
+
+# mne==1.8.0
+
+# umap-learn
