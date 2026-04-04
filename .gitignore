@@ -6,7 +6,10 @@ Thumbs.db
 .DS_Store
 
 # --- DATA & HEAVY FILES ---
-# This ignores your 3D datasets so they don't crash GitHub
+# Keep large training assets out of Git
+3D-GEN/image/
+3D-GEN/eeg_of_subjects/
+3D-GEN/phase1_output/
 data/
 temp/
 *.obj
@@ -43,6 +46,3 @@ Thumbs.db
 *.pth
 *.h5
 *.ckpt
-
-#data folder ignore
-data/
