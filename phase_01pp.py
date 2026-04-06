@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - keeps the module importable if SciPy is 
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_EEG_DIR = PROJECT_ROOT / "eeg_of_subjects"
+DEFAULT_EEG_DIR = PROJECT_ROOT / "data" / "EEGdata"
 
 
 @dataclass(frozen=True)
@@ -86,8 +86,9 @@ def subject_wise_normalize(signal_array: np.ndarray, epsilon: float = 1e-8) -> n
 
 	mean = signal_array.mean(axis=0, keepdims=True)
 	std = signal_array.std(axis=0, keepdims=True)
-	return (signal_array - mean) / (std + epsilon)
-
+	normalized = (signal_array - mean) / (std + epsilon)
+	normalized = np.clip(normalized,-5,5)
+	return normalized
 
 def bandpass_filter(signal_array: np.ndarray, sampling_rate: int, low_cut_hz: float, high_cut_hz: float) -> np.ndarray:
 	"""Apply a Butterworth band-pass filter if SciPy is available."""
@@ -193,7 +194,7 @@ def _demo() -> None:
 	"""Quick local smoke test for phase 1."""
 
 	config = Phase1Config(use_bandpass=False)
-	dataset = phase1_prepare_data(config=config, save_dir=PROJECT_ROOT / "phase1_output")
+	dataset = phase1_prepare_data(config=config, save_dir=PROJECT_ROOT / "outputs" / "phase1_output")
 	print(f"Prepared {len(dataset)} subject files.")
 	for record in dataset[:3]:
 		print(
