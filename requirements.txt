@@ -1,5 +1,5 @@
-torch==2.4.1
-torchvision==0.19.1
+torch
+torchvision
 
 numpy==1.26.4
 scipy==1.13.1
