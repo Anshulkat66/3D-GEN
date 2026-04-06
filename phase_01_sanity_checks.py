@@ -110,4 +110,16 @@ if extreme_values:
 else:
     print("  None")
 
+#random subject visual check :
+# import matplotlib.pyplot as plt
+# import random
+
+# sample_files = random.sample(files, 3)
+
+# for f in sample_files:
+#     eeg = np.load(f)
+#     plt.plot(eeg[:500, 0])
+#     plt.title(f.name)
+#     plt.show()
+
 print("\n✅ CHECK COMPLETE")
