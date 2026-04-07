@@ -30,3 +30,24 @@ for batch in loader:
     print("Output shape:", tokens.shape)
     break
 
+#sanity checks :
+
+print("Min:", tokens.min().item())
+print("Max:", tokens.max().item())
+print("Mean:", tokens.mean().item())
+print("Std:", tokens.std().item())
+
+#
+print("Token variance across time:", tokens.var(dim=1).mean().item())
+
+#
+batch2 = next(iter(loader)).to(device)
+
+with torch.no_grad():
+    tokens2 = model(batch2)
+
+print((tokens - tokens2).abs().mean().item())
+
+#
+
+print(tokens[0, 0, :10])
