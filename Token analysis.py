@@ -109,3 +109,69 @@ plt.title("Token Value Distribution")
 plt.xlabel("Value")
 plt.ylabel("Frequency")
 plt.show()
+
+
+#random token difference:
+
+import torch
+import matplotlib.pyplot as plt
+import random
+
+diffs = []
+
+B, T, D = tokens.shape
+
+for i in range(200):
+    b = random.randint(0, B-1)
+    t1 = random.randint(0, T-1)
+    t2 = random.randint(0, T-1)
+
+    d = torch.mean(torch.abs(tokens[b, t1] - tokens[b, t2])).item()
+    diffs.append(d)
+
+# scatter plot
+plt.figure()
+plt.scatter(range(len(diffs)), diffs, s=10)
+plt.title("Random Token Differences (Scatter)")
+plt.xlabel("Sample Index")
+plt.ylabel("Difference")
+plt.show()
+
+#temporal scatter plot:
+temporal_diffs = []
+
+b = 0  # pick one sample
+
+for i in range(tokens.shape[1] - 1):
+    d = torch.mean(torch.abs(tokens[b, i] - tokens[b, i+1])).item()
+    temporal_diffs.append(d)
+
+# scatter plot
+plt.figure()
+plt.scatter(range(len(temporal_diffs)), temporal_diffs, s=10)
+plt.title("Temporal Token Differences (Scatter)")
+plt.xlabel("Token Index (Time)")
+plt.ylabel("Difference")
+plt.show()
+
+
+#distance vs difference
+distances = []
+diffs = []
+
+for i in range(tokens.shape[1]):
+    for j in range(i+1, tokens.shape[1]):
+        d_time = j - i
+        d_feat = torch.mean(torch.abs(tokens[0, i] - tokens[0, j])).item()
+
+        distances.append(d_time)
+        diffs.append(d_feat)
+
+# scatter
+import matplotlib.pyplot as plt
+
+plt.scatter(distances, diffs, s=5)
+plt.xlabel("Time Distance")
+plt.ylabel("Feature Difference")
+plt.title("Distance vs Difference")
+plt.show()
