@@ -10,6 +10,7 @@ Thumbs.db
 3D-GEN/image/
 3D-GEN/eeg_of_subjects/
 3D-GEN/phase1_output/
+image/
 data/
 temp/
 outputs/
@@ -18,6 +19,12 @@ outputs/
 *.ply
 *.zip
 *.tar.gz
+data/
+input/
+output/
+outputs/
+__pycache__/
+*.npy
 
 # --- PYTHON JUNK ---
 # These are files your computer creates to run Python faster

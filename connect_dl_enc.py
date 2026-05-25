@@ -15,8 +15,8 @@ data_dir = "outputs/phase1_output"
 loader = create_dataloader(
     data_dir,
     batch_size=4,     # keep small initially
-    window_size=1024,
-    stride=512
+    window_size=600,
+    stride=600
 )
 
 
