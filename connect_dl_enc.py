@@ -15,8 +15,8 @@ data_dir = "outputs/phase1_output"
 loader = create_dataloader(
     data_dir,
     batch_size=4,     # keep small initially
-    window_size=1024,
-    stride=512
+    window_size=600,
+    stride=600
 )
 
 
@@ -32,22 +32,22 @@ for batch in loader:
 
 #sanity checks :
 
-print("Min:", tokens.min().item())
-print("Max:", tokens.max().item())
-print("Mean:", tokens.mean().item())
-print("Std:", tokens.std().item())
+# print("Min:", tokens.min().item())
+# print("Max:", tokens.max().item())
+# print("Mean:", tokens.mean().item())
+# print("Std:", tokens.std().item())
 
-#
-print("Token variance across time:", tokens.var(dim=1).mean().item())
+# #
+# print("Token variance across time:", tokens.var(dim=1).mean().item())
 
-#
-batch2 = next(iter(loader)).to(device)
+# #
+# batch2 = next(iter(loader)).to(device)
 
-with torch.no_grad():
-    tokens2 = model(batch2)
+# with torch.no_grad():
+#     tokens2 = model(batch2)
 
-print((tokens - tokens2).abs().mean().item())
+# print((tokens - tokens2).abs().mean().item())
 
-#
+# #
 
-print(tokens[0, 0, :10])
+# print(tokens[0, 0, :10])
