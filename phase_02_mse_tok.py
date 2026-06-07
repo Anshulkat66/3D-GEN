@@ -73,7 +73,7 @@ class Tokenizer(nn.Module):
 
 
 class EEGEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, embed_dim: int = 256):
         super().__init__()
 
         self.multi_scale = MultiScaleEEGEncoder(
@@ -83,7 +83,7 @@ class EEGEncoder(nn.Module):
 
         self.tokenizer = Tokenizer(
             in_dim=128,
-            embed_dim=256,
+            embed_dim=embed_dim,
             stride=4
         )
 
@@ -102,8 +102,11 @@ class EEGEncoder(nn.Module):
 if __name__ == "__main__":
     model = EEGEncoder()
 
-    dummy = torch.randn(2, 1024, 64)
+    # Real trial shape: [Batch, Time=250, Channels=64]
+    dummy = torch.randn(2, 250, 64)
 
     out = model(dummy)
 
+    # Expected: [2, 62, 256]  (250 // 4 = 62 tokens, embed_dim=256)
+    print("Input  shape:", dummy.shape)
     print("Output shape:", out.shape)

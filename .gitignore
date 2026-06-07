@@ -14,6 +14,8 @@ image/
 data/
 temp/
 outputs/
+Trial/
+checkpoints/
 *.obj
 *.stl
 *.ply
