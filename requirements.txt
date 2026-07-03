@@ -21,3 +21,8 @@ umap-learn
 # pip install git+https://github.com/openai/CLIP.git
 ftfy
 regex
+
+# Stable Diffusion v1.5 dependencies
+diffusers>=0.26.0
+transformers>=4.36.0
+accelerate>=0.27.0

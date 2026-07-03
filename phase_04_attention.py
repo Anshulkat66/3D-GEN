@@ -1,18 +1,21 @@
 """Phase 4: Lightweight Attention Mechanism.
 
-Takes the token sequence [B, 62, 256] from Phase 3 (MultiScaleEEGEncoder)
+Takes the token sequence [B, 63, token_dim] from Phase 3 (MultiScaleEEGEncoder)
 and applies 2-layer Multi-Head Self-Attention to produce a refined
 shared embedding where every token is context-aware of all other tokens.
 
 This shared embedding is then passed to Phase 5 for 6-branch feature separation.
 
-Architecture:
-    Input [B, 62, 256]
-      + Learnable Positional Embeddings
-      ↓ Transformer Layer 1: MHSA (4 heads) + FFN (256→512→256) + LayerNorm
-      ↓ Transformer Layer 2: MHSA (4 heads) + FFN (256→512→256) + LayerNorm
+Architecture (with actual training config token_dim=192, num_heads=3):
+    Input [B, 63, 192]
+      + Learnable Positional Embeddings [1, 63, 192]
+      ↓ Transformer Layer 1: MHSA (3 heads × 64 dim) + FFN (192→384→192) + PreLayerNorm
+      ↓ Transformer Layer 2: MHSA (3 heads × 64 dim) + FFN (192→384→192) + PreLayerNorm
       ↓ Final LayerNorm
-    Output [B, 62, 256]  ← same shape, every token is now context-aware
+    Output [B, 63, 192]  ← same shape, every token is now context-aware
+
+Note: token count is 63 (not 62) after Phase 3 Tokenizer padding fix.
+Note: 192/3 = 64-dim per head (standard). Smaller than 256 to reduce overfit risk.
 """
 
 import torch
@@ -23,12 +26,13 @@ class EEGTransformerEncoder(nn.Module):
     """Lightweight 2-layer Transformer Encoder for EEG token sequences.
 
     Args:
-        token_dim  : dimension of each input token        (default: 256)
-        num_heads  : number of attention heads             (default: 4)
-        ff_dim     : feed-forward hidden dimension         (default: 512)
-        num_layers : number of stacked transformer layers  (default: 2)
-        dropout    : dropout probability                   (default: 0.1)
-        max_tokens : number of learnable position slots    (default: 62)
+        token_dim  : dimension of each input token        (actual training default: 192)
+        num_heads  : number of attention heads             (actual training default: 3  → 3×64-dim heads)
+        ff_dim     : feed-forward hidden dimension         (actual training default: 384 → 2×token_dim)
+        num_layers : number of stacked transformer layers  (actual training default: 2)
+        dropout    : dropout probability                   (actual training default: 0.32)
+        max_tokens : number of learnable position slots    (default: 63 — after Bug #18 tokenizer padding fix;
+                                                            was 62 before padding=1 was added to Tokenizer)
     """
 
     def __init__(
@@ -38,21 +42,21 @@ class EEGTransformerEncoder(nn.Module):
         ff_dim: int = 512,
         num_layers: int = 2,
         dropout: float = 0.1,
-        max_tokens: int = 62,
+        max_tokens: int = 63,   # 63 tokens from Phase 3 Tokenizer (padding=1 fix)
     ):
         super().__init__()
 
         # ── Learnable Positional Embeddings ───────────────────────────────
-        # Shape [1, 62, 256] — one embedding per token position.
+        # Shape [1, 63, token_dim] — one embedding per token position.
         # Broadcast across batches automatically.
-        # Tells the model which token came first, second, ... 62nd in time.
+        # Tells the model which token came first, second, ... 63rd in time.
         self.pos_embedding = nn.Parameter(torch.zeros(1, max_tokens, token_dim))
         nn.init.trunc_normal_(self.pos_embedding, std=0.02)  # small random init (ViT-style)
 
         # ── Transformer Encoder Layers ────────────────────────────────────
-        # Each layer contains:
-        #   1. Multi-Head Self-Attention (4 heads × 64 dim each = 256 total)
-        #   2. Feed-Forward MLP         (256 → 512 → 256)
+        # Each layer contains (with actual training config token_dim=192, num_heads=3):
+        #   1. Multi-Head Self-Attention (3 heads × 64 dim = 192 total)  ← standard 64-dim heads
+        #   2. Feed-Forward MLP         (192 → ff_dim → 192)
         #   3. LayerNorm + Residual     (applied before each sub-layer — Pre-LN)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=token_dim,
@@ -70,14 +74,22 @@ class EEGTransformerEncoder(nn.Module):
             norm=nn.LayerNorm(token_dim),   # final LayerNorm after all layers complete
         )
 
-        self.dropout = nn.Dropout(dropout)
+        # NOTE: No external dropout here.
+        # TransformerEncoderLayer already applies dropout internally:
+        #   - After attention softmax weights
+        #   - After attention projection output
+        #   - After FFN first linear layer
+        # That is 3× per layer, 6× total for 2 layers.
+        # Adding an external Dropout on top would compound to 7 passes at p=0.32,
+        # leaving only ~7% of token values active during training but 100% at inference
+        # (14× information density shift → model generates noise at generation time).
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x   : [B, T, D]  token sequence from Phase 3
-                   B = batch, T = 62 tokens, D = 256 dim
+                   B = batch, T = 63 tokens (after Phase 3 padding fix), D = token_dim
 
         Returns:
             out : [B, T, D]  same shape — every token is now context-aware
@@ -86,11 +98,9 @@ class EEGTransformerEncoder(nn.Module):
         # Without this, the Transformer treats tokens as an unordered set
         x = x + self.pos_embedding[:, :x.size(1), :]
 
-        # Step 2: light dropout on the positionally-encoded input
-        x = self.dropout(x)
-
-        # Step 3: pass through 2 Transformer layers
-        # Each token now attends to all 61 other tokens bidirectionally
+        # Step 2: pass through 2 Transformer layers
+        # Each layer applies dropout internally (after attention + after FFN)
+        # 3× per layer × 2 layers = 6 total dropout passes at p=0.32
         out = self.transformer(x)
 
         return out
@@ -102,11 +112,11 @@ if __name__ == "__main__":
     print("  PHASE 4 — ATTENTION MECHANISM VERIFICATION")
     print("=" * 60)
 
-    model = EEGTransformerEncoder()
+    model = EEGTransformerEncoder(token_dim=192, num_heads=3, ff_dim=384, num_layers=2, dropout=0.32)
     model.eval()
 
-    # Real input from Phase 3: [Batch=64, Tokens=62, Dim=256]
-    dummy = torch.randn(64, 62, 256)
+    # Real input from Phase 3: [Batch=64, Tokens=63, Dim=192]  (token_dim=192, 3 heads×64-dim)
+    dummy = torch.randn(64, 63, 192)
 
     with torch.no_grad():
         out = model(dummy)
@@ -133,7 +143,7 @@ if __name__ == "__main__":
     print(f"[4] Mean abs diff (input vs output): {mean_diff:.6f}  {'✅ model is transforming data' if changed else '❌ output unchanged'}")
 
     # ── CHECK 5: Positional embeddings shape ───────────────────────────────
-    pos_shape_ok = model.pos_embedding.shape == (1, 62, 256)
+    pos_shape_ok = model.pos_embedding.shape == (1, 63, 192)
     print(f"[5] Positional embedding shape: {tuple(model.pos_embedding.shape)}  {'✅' if pos_shape_ok else '❌'}")
 
     # ── Parameter count ────────────────────────────────────────────────────

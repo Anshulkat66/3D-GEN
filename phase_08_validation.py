@@ -24,8 +24,7 @@ from phase_06_training import EEGPipeline, build_clip_cache_images, CLIP_AVAILAB
 def run_validation(
     data_dir:        str = "data/EEGdatanpy",
     image_dir:       str = "data/image",
-    checkpoint_dir:  str = "checkpoints/phase06",
-    checkpoint_path: str = None,          # if None → auto-picks latest epoch
+    checkpoint_path: str = "checkpoints/phase06_2.24_leak_prevented/best_model.pt",
     output_dir:      str = "outputs/validation",
     perplexity:      int = 30,
     random_seed:     int = 42,
@@ -33,19 +32,24 @@ def run_validation(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\nDevice: {device}")
 
-    # ── Resolve Checkpoint Path (auto-pick latest if not specified) ───────────
-    if checkpoint_path is None:
-        ckpt_dir = Path(checkpoint_dir)
+    # ── Resolve Checkpoint Path ───────────────────────────────────────────────
+    ckpt_path = Path(checkpoint_path) if checkpoint_path else None
+    
+    if ckpt_path is None or not ckpt_path.exists():
+        # Fallback: auto-pick latest in checkpoints/phase06
+        ckpt_dir = Path("checkpoints/phase06")
         candidates = sorted(
             ckpt_dir.glob("checkpoint_epoch*.pt"),
             key=lambda p: int(p.stem.replace("checkpoint_epoch", ""))
         )
         if not candidates:
-            raise FileNotFoundError(f"No checkpoints found in: {ckpt_dir}")
+            raise FileNotFoundError(
+                f"Checkpoint not found at '{checkpoint_path}' and no fallback candidates found in checkpoints/phase06."
+            )
         ckpt_path = candidates[-1]   # highest epoch number
-        print(f"Auto-selected latest checkpoint: {ckpt_path.name}")
+        print(f"Specified checkpoint not found/given. Auto-selected latest fallback: {ckpt_path.name}")
     else:
-        ckpt_path = Path(checkpoint_path)
+        print(f"Using target checkpoint path: {ckpt_path}")
 
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
@@ -92,7 +96,7 @@ def run_validation(
         ff_dim=ff_dim,
         num_layers=num_layers,
         dropout=dropout,
-        appearance_dim=512,
+        appearance_dim=768,   # ViT-L/14 image embedding dim
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -326,5 +330,29 @@ def run_validation(
 
 
 if __name__ == "__main__":
-    run_validation()
+    import argparse
+    parser = argparse.ArgumentParser(description="Phase 8: EEG Latent Space Validation")
+    parser.add_argument("--data_dir", type=str, default="data/EEGdatanpy",
+                        help="Path to pre-epoched, pre-normalized EEG data")
+    parser.add_argument("--image_dir", type=str, default="data/image",
+                        help="Path to original stimulus images")
+    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/phase06_2.24_leak_prevented/best_model.pt",
+                        help="Path to target model checkpoint to evaluate")
+    parser.add_argument("--output_dir", type=str, default="outputs/validation",
+                        help="Directory to save generated t-SNE plots")
+    parser.add_argument("--perplexity", type=int, default=30,
+                        help="t-SNE perplexity hyperparameter")
+    parser.add_argument("--random_seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+
+    args = parser.parse_args()
+
+    run_validation(
+        data_dir=args.data_dir,
+        image_dir=args.image_dir,
+        checkpoint_path=args.checkpoint_path,
+        output_dir=args.output_dir,
+        perplexity=args.perplexity,
+        random_seed=args.random_seed
+    )
 

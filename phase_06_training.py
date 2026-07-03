@@ -128,47 +128,71 @@ def subject_invariance_loss(
     cat_labels:   torch.Tensor,  # [B] integer object category
     subj_labels:  torch.Tensor,  # [B] integer subject id
     alpha:        float = 1.0,   # weight: Object invariance term
-    beta:         float = 1.0,   # weight: Subject discrimination term
+    beta:         float = 1.0,   # weight: Subject branch term
 ) -> torch.Tensor:
-    """For pairs (i, j) where same object but different subject:
+    """For pairs (i, j) based on same/different subject and category:
 
-      Object branch  → MAXIMISE cosine similarity  (ignore who looked)
-                       AND MINIMISE different-category similarity (prevents collapse)
-      Subject branch → MINIMISE cosine similarity  (capture who looked)
+    Object branch:
+      PULL: same category, different subject  → Object latents should be SIMILAR
+      PUSH: different category                → Object latents should be DIFFERENT
+
+    Subject branch:
+      PULL: same subject,  different category → Subject latents should be SIMILAR
+            (Encoding WHO, so representation must be consistent across objects)
+      PUSH: same category, different subject  → Subject latents should be DIFFERENT
+            (Encoding WHO, so different people viewing same object must be distinct)
 
     If no valid pairs exist in this batch, returns 0.
     """
     device = obj_latents.device
 
-    same_cat  = (cat_labels.unsqueeze(1) == cat_labels.unsqueeze(0))   # [B, B]
-    diff_subj = (subj_labels.unsqueeze(1) != subj_labels.unsqueeze(0)) # [B, B]
-    
-    # Object Positive: same category, different subject
+    same_cat  = (cat_labels.unsqueeze(1)  == cat_labels.unsqueeze(0))
+    diff_cat  = ~same_cat
+    same_subj = (subj_labels.unsqueeze(1) == subj_labels.unsqueeze(0))
+    diff_subj = ~same_subj
+
+    # Object Positive: same category, different subject -> PULL
     obj_pos_mask = (same_cat & diff_subj)
     obj_pos_mask.fill_diagonal_(False)
 
-    # Object Negative: different category
-    obj_neg_mask = ~same_cat
+    # Object Negative: different category -> PUSH
+    obj_neg_mask = diff_cat
 
-    # Subject: same category, different subject (should have different subject latents)
-    subj_mask = (same_cat & diff_subj)
-    subj_mask.fill_diagonal_(False)
+    # Subject PUSH: same category, different subject -> push apart
+    subj_push_mask = (same_cat & diff_subj)
+    subj_push_mask.fill_diagonal_(False)
 
-    if obj_pos_mask.sum() == 0 or obj_neg_mask.sum() == 0 or subj_mask.sum() == 0:
+    # Subject PULL: same subject, different category -> pull together  [Bug #23 fix]
+    # Same person sees dog vs airplane -> subject latent must stay CONSISTENT
+    subj_pull_mask = (same_subj & diff_cat)
+    subj_pull_mask.fill_diagonal_(False)
+
+    if obj_pos_mask.sum() == 0 or obj_neg_mask.sum() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    if subj_push_mask.sum() == 0 and subj_pull_mask.sum() == 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
     # Cosine similarity matrices (features are already L2-normalised)
     obj_sim  = torch.matmul(obj_latents,  obj_latents.T)   # [B, B]
     subj_sim = torch.matmul(subj_latents, subj_latents.T)  # [B, B]
 
-    # Object: pull same-class together (maximise similarity)
-    # and push different-class apart (minimise similarity above 0.0)
+    # Object: pull same-class together, push different-class apart
+    # Bug #24 fix: both terms use .mean() → pair counts already normalized.
+    # The old 2× push multiplier caused over-dispersal on the unit sphere.
     obj_pos_loss = -obj_sim[obj_pos_mask].mean()
     obj_neg_loss = torch.relu(obj_sim[obj_neg_mask]).mean()
-    obj_loss = obj_pos_loss + 2.0 * obj_neg_loss
+    obj_loss = obj_pos_loss + obj_neg_loss   # equal weight after mean-normalization
 
-    # Subject: minimise similarity → maximise negative similarity
-    subj_loss = subj_sim[subj_mask].mean()
+    # Subject: PULL same_subj/diff_cat + PUSH same_cat/diff_subj
+    # Bug #24 fix: .mean() already normalizes by pair count.
+    # Old 2× push caused subject features to over-disperse on unit sphere.
+    subj_pull_loss = (-subj_sim[subj_pull_mask].mean()
+                      if subj_pull_mask.sum() > 0
+                      else torch.tensor(0.0, device=device))
+    subj_push_loss = ( subj_sim[subj_push_mask].mean()
+                      if subj_push_mask.sum() > 0
+                      else torch.tensor(0.0, device=device))
+    subj_loss = subj_pull_loss + subj_push_loss   # equal weight after mean-normalization
 
     return alpha * obj_loss + beta * subj_loss
 
@@ -218,11 +242,13 @@ def intra_class_consistency_loss(
     # Cosine similarity (features are already L2-normalised)
     obj_sim = torch.matmul(obj_latents, obj_latents.T)  # [B, B]
 
-    # Pull positives together, push negatives apart (margin 0.0)
+    # Pull positives together, push negatives apart
+    # Bug #24 fix: .mean() already normalizes by pair count — equal weighting.
+    # Old 2× push caused object features to over-disperse on unit sphere.
     pos_loss = -obj_sim[pos_mask].mean()
     neg_loss = torch.relu(obj_sim[neg_mask]).mean()
 
-    return pos_loss + 2.0 * neg_loss
+    return pos_loss + neg_loss   # equal weight after mean-normalization
 
 
 
@@ -252,11 +278,14 @@ def grad_reverse(x, alpha=1.0):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def contrastive_clip_loss(
-    appearance_latents: torch.Tensor,  # [B, 512]  L2-normalised
+    appearance_latents: torch.Tensor,  # [B, 768]  L2-normalised  (ViT-L/14)
     labels:             list,           # list of raw label strings
-    clip_cache:         dict,           # {label_str → tensor [512]} pre-built
+    clip_cache:         dict,           # {label_str → tensor [768]} pre-built
     device:             torch.device,
-    temperature:        float = 0.07,   # Standard InfoNCE temperature parameter
+    temperature:        float = 0.15,   # ← was 0.07 (CLIP paper value for 400M pairs)
+                                        #   0.07 forces per-image memorization on 192K noisy EEG
+                                        #   0.15 allows categorical grouping → generalizes to unseen images
+                                        #   Standard for EEG-to-image contrastive learning (Mind-Vis, DREAM)
 ) -> torch.Tensor:
     """InfoNCE loss to align Appearance latents with CLIP target embeddings.
 
@@ -264,23 +293,57 @@ def contrastive_clip_loss(
       - similarity(appearance_i, clip_target_i) is MAXIMISED (pull)
       - similarity(appearance_i, clip_target_j) is MINIMISED for j != i (push)
 
-    This contrastive force prevents collapse to a constant average vector.
+    Temperature note:
+      Low temperature (0.07): massively amplifies similarity differences.
+        Forces model to push EVERY sample to a unique point on the unit sphere.
+        Only works with massive clean datasets (CLIP: 400M pairs).
+        On 192K noisy EEG: model memorizes training coordinates, fails on test.
+      Higher temperature (0.15): allows similar EEG trials to cluster together.
+        Model learns categorical structure rather than instance memorization.
+        Generalizes to unseen images within the same category.
     """
+    import numpy as np
+    import torch.nn.functional as F
+
     clip_feats = torch.stack([clip_cache[lbl] for lbl in labels]).to(device)
     clip_feats = F.normalize(clip_feats, dim=-1)
 
     # Cosine similarities matrix between all latents and all CLIP targets
-    # [B, 512] @ [512, B] → [B, B]
+    # [B, 768] @ [768, B] → [B, B]   (768 = ViT-L/14 embedding dim)
     sim_matrix = torch.matmul(appearance_latents, clip_feats.T) / temperature
 
-    # Ground truth: sample i matches target i
+    # ── False Negative Masking (Bug #10 fix) ────────────────────────────────
+    # The THINGS-EEG dataset has 12 subjects. In a batch of 256, it is common
+    # for multiple subjects to have viewed the SAME image (same label string).
+    # Those pairs share identical CLIP targets → they should NOT be negatives.
+    labels_arr = np.array(labels)
+    same_label = torch.tensor(
+        labels_arr[:, None] == labels_arr[None, :],   # [B, B] bool
+        device=device
+    )
+    same_label.fill_diagonal_(False)   # diagonal is the genuine positive — keep it
+    # Apply mask: same-label off-diagonal positions → -inf (excluded from softmax)
+    sim_matrix = sim_matrix.masked_fill(same_label, float('-inf'))
+
+    # Supervised targets: sample i's positive is at column i (the diagonal)
     targets = torch.arange(len(labels), device=device)
 
-    # Bi-directional loss (standard CLIP loss: image-to-text + text-to-image)
+    # Bi-directional loss (standard CLIP loss: latent-to-target + target-to-latent)
     loss_latents = F.cross_entropy(sim_matrix, targets)
     loss_targets = F.cross_entropy(sim_matrix.T, targets)
+    infonce_loss = 0.5 * (loss_latents + loss_targets)
 
-    return 0.5 * (loss_latents + loss_targets)
+    # ── Cross-Subject Appearance Alignment (explicit pull) ───────────────────
+    cross_subj_loss = torch.tensor(0.0, device=device)
+    if same_label.sum() > 0:
+        # Cosine similarity between appearance embeddings
+        # (features are already L2-normalised → dot product = cosine sim)
+        app_sim = torch.matmul(appearance_latents, appearance_latents.T)  # [B, B]
+        # Maximise similarity for same-image pairs: loss = -mean(sim for same-image pairs)
+        cross_subj_loss = -app_sim[same_label].mean()
+
+    # Total: InfoNCE (CLIP alignment) + 0.5 × cross-subject appearance pull
+    return infonce_loss + 0.5 * cross_subj_loss
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,7 +365,7 @@ def build_clip_cache_images(
     they look different. This is the correct target for the Appearance branch.
 
     Returns:
-        dict {label_string: cpu tensor [512]}
+        dict {label_string: cpu tensor [768]}  ← ViT-L/14 image embedding dim
     """
     if not CLIP_AVAILABLE:
         raise ImportError(
@@ -310,8 +373,14 @@ def build_clip_cache_images(
             "  pip install git+https://github.com/openai/CLIP.git"
         )
 
-    print("  Building CLIP image cache...")
-    clip_model, preprocess = clip_module.load("ViT-B/32", device=device)
+    print("  Building CLIP image cache (ViT-L/14 — must match Phase 7 + Stable Diffusion)...")
+    # CRITICAL: Must use ViT-L/14 here — NOT ViT-B/32.
+    # Stable Diffusion v1.5 uses ViT-L/14 for its text encoder (768-dim space).
+    # Phase 7 also uses ViT-L/14 to produce text sequence targets.
+    # If we use ViT-B/32 here (512-dim), the appearance branch learns targets
+    # in a completely different embedding space from what Phase 7 expects.
+    # ViT-B/32 and ViT-L/14 image embeddings are NOT interchangeable.
+    clip_model, preprocess = clip_module.load("ViT-L/14", device=device)
     clip_model.eval()
 
     img_root    = Path(image_dir)
@@ -332,8 +401,8 @@ def build_clip_cache_images(
         tensor = preprocess(img).unsqueeze(0).to(device)   # [1, 3, 224, 224]
 
         with torch.no_grad():
-            feat = clip_model.encode_image(tensor).float()  # [1, 512]
-            feat = F.normalize(feat, dim=-1).squeeze(0)     # [512]
+            feat = clip_model.encode_image(tensor).float()  # [1, 768]  ← ViT-L/14
+            feat = F.normalize(feat, dim=-1).squeeze(0)     # [768]
 
         clip_cache[label] = feat.cpu()
 
@@ -365,9 +434,21 @@ class EEGPipeline(nn.Module):
         num_heads: int = 4,
         ff_dim: int = 512,
         num_layers: int = 2,
-        dropout: float = 0.1,
-        appearance_dim: int = 512,
+        dropout: float = 0.1,            # BranchMLP dropout (Phase 5 separation)
+        transformer_dropout: float = 0.1, # Transformer internal dropout (Phase 4)
+        appearance_dim: int = 768,        # ViT-L/14 image embedding dim (NOT 512 which is ViT-B/32)
     ):
+        # Bug #21 fix: split dropout into two separate rates.
+        # Problem: the same dropout=0.32 was passed to BOTH:
+        #   - EEGTransformerEncoder: 2 internal passes per layer × 2 layers = 4 passes
+        #   - EEGFeatureSeparation BranchMLP: 1 pass per branch
+        # Combined: (1-0.32)^5 = 0.145 → 85% info destroyed at training, 0% at inference
+        # → ~7× information density shift between train and inference.
+        #
+        # Fix: separate rates
+        #   transformer_dropout=0.10 → (0.90)^4 = 0.656 (34% destroyed by Transformer)
+        #   dropout=0.32             → × 0.68         (55% total destroyed)
+        #   Shift: 1/0.446 = 2.2×  (vs 6.9× before)
         super().__init__()
         self.encoder    = EEGEncoder(embed_dim=token_dim)
         self.attention  = EEGTransformerEncoder(
@@ -375,12 +456,12 @@ class EEGPipeline(nn.Module):
             num_heads=num_heads,
             ff_dim=ff_dim,
             num_layers=num_layers,
-            dropout=dropout,
+            dropout=transformer_dropout,   # Bug #21: lighter dropout for 4-pass Transformer
         )
         self.separation = EEGFeatureSeparation(
             token_dim=token_dim,
             appearance_dim=appearance_dim,
-            dropout=dropout,
+            dropout=dropout,               # Bug #21: stronger dropout ok for 1-pass BranchMLP
         )
 
     def forward(self, eeg: torch.Tensor) -> dict:
@@ -388,11 +469,19 @@ class EEGPipeline(nn.Module):
         Args:
             eeg : [B, 250, 64]  raw EEG batch from DataLoader
         Returns:
-            dict of 6 L2-normalised branch latents
+            dict of 6 L2-normalised branch latents + 'shared' key:
+              latents['shared'] = mean-pooled transformer output [B, token_dim]
+                                  used by DANN GRL (Bug fix: apply BEFORE separation)
         """
-        tokens    = self.encoder(eeg)         # [B, 62, token_dim]
-        embedding = self.attention(tokens)    # [B, 62, token_dim]
+        tokens    = self.encoder(eeg)          # [B, 63, token_dim]  (63 after Bug #19 padding fix)
+        embedding = self.attention(tokens)     # [B, 63, token_dim]
         latents   = self.separation(embedding) # {6 branches}
+
+        # Bug fix: expose shared representation BEFORE separation for DANN GRL.
+        # Mean-pool across the token (time) dimension to get [B, token_dim].
+        # This is the signal that feeds ALL branches — regularizing it for
+        # subject-invariance means every branch benefits from the adversarial loss.
+        latents["shared"] = embedding.mean(dim=1)   # [B, token_dim]
         return latents
 
 
@@ -453,29 +542,51 @@ def augment_eeg(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def orthogonality_loss(latents: dict) -> torch.Tensor:
-    """Enforces cross-correlation orthogonality between key latents using batch-wise L2 normalization.
-    
-    This prevents representation collapse: if a branch collapses to a constant, 
-    its batch-wise L2-normalized vector becomes a constant vector of ones (scaled by 1/sqrt(B)),
-    resulting in a cosine similarity of 1.0 (maximum penalty) with any other collapsed branch.
-    Only orthogonal, diverse features can achieve the minimum loss of 0.0.
+    """Cross-branch decoupling via cross-covariance penalty.
+
+    Penalises co-variation between object↔subject and subject↔appearance
+    feature dimensions across the batch. Forces the branches to represent
+    different aspects of the EEG signal (identity, category, visual style)
+    without redundancy.
+
+    NOTE — this is NOT the same as Barlow Twins:
+      Barlow Twins: cross-VIEW correlation on a SINGLE branch (two augmented
+                    forward passes, [D,D] matrix, diagonal→1 + off-diag→0).
+      This loss:    cross-BRANCH covariance between DIFFERENT branches
+                    ([D_obj, D_subj] matrix, all entries→0).
+
+    Bug #14 fix:
+      Old code used F.normalize(dim=0) which L2-normalizes each feature column
+      across the batch. This is NOT batch standardization — it leaves non-zero
+      means, so the "correlation" is contaminated by mean offsets and doesn't
+      measure true co-variation.
+
+      Correct approach: subtract batch mean per feature (zero-centering), then
+      compute cross-covariance / B. This answers:
+        "After removing average activation, do object and subject neurons
+         consistently activate together across samples?"
+      If yes → high covariance → high loss → model is penalised.
+      If no  → covariance ≈ 0 → loss ≈ 0 → branches are decoupled.
     """
-    obj = latents["object"]          # [B, 128]
-    subj = latents["subject"]        # [B, 64]
-    app = latents["appearance"]      # [B, 512]
+    obj  = latents["object"]      # [B, 128]
+    subj = latents["subject"]     # [B, 64]
+    app  = latents["appearance"]  # [B, 768]
 
-    # L2 normalize along the batch dimension (dim=0) to represent column cosine similarities
-    eps = 1e-8
-    obj_norm  = F.normalize(obj,  p=2, dim=0, eps=eps)
-    subj_norm = F.normalize(subj, p=2, dim=0, eps=eps)
-    app_norm  = F.normalize(app,  p=2, dim=0, eps=eps)
+    B = obj.shape[0]
 
-    # Cross-correlation matrices: elements represent cosine similarities between feature columns
-    C_obj_subj = torch.matmul(obj_norm.T, subj_norm)          # [128, 64]
-    C_subj_app = torch.matmul(subj_norm.T, app_norm)          # [64, 512]
+    # Zero-center each feature across the batch (remove mean bias)
+    # Without this, the cross-covariance is contaminated by non-zero means.
+    obj_c  = obj  - obj.mean(dim=0, keepdim=True)   # [B, 128]
+    subj_c = subj - subj.mean(dim=0, keepdim=True)  # [B, 64]
+    app_c  = app  - app.mean(dim=0, keepdim=True)   # [B, 768]
 
-    # Penalize non-zero entries: Decouple subject from object, and subject from appearance (blocks subject leakage).
-    # Object and Appearance are allowed to correlate (so CLIP guide can shape category latents).
+    # Cross-covariance matrices (normalized by batch size)
+    # C[i, j] = covariance between feature i of branch A and feature j of branch B
+    C_obj_subj = (obj_c.T @ subj_c) / B    # [128, 64]
+    C_subj_app = (subj_c.T @ app_c) / B    # [64,  768]
+
+    # Penalize non-zero cross-covariance: object ↔ subject and subject ↔ appearance
+    # Object ↔ Appearance allowed to correlate (CLIP shapes both category + visual latents)
     loss = (C_obj_subj ** 2).mean() + (C_subj_app ** 2).mean()
     return loss
 
@@ -567,6 +678,161 @@ def evaluate_test_accuracy(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Loss Balance Reporter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_loss_balance(
+    epoch:        int,
+    n_batches:    int,
+    l1_sum:       float,  # Object CE accumulated
+    l_subj_ce_sum:float,  # Subject CE accumulated
+    l2_sum:       float,  # Subject Invariance accumulated
+    l3_sum:       float,  # CLIP InfoNCE accumulated
+    l_ortho_sum:  float,  # Barlow Ortho accumulated
+    l_intra_sum:  float,  # Intra-Class accumulated
+    l_adv_sum:    float,  # Adversary CE accumulated
+    w_object:     float,
+    w_subject:    float,
+    w_clip:       float,
+    w_ortho:      float,
+    w_intra:      float,
+    w_adv:        float,
+    clip_active:  bool,
+    avg_cosim:    float,
+    T:            int = 30,   # Normalized softmax temperature
+) -> None:
+    """Prints a gradient-scale-aware loss balance report.
+
+    WHY THIS EXISTS:
+      Loss weights on paper (w_object=1.0, w_intra=2.5) do NOT reflect the
+      true gradient magnitude each loss contributes to the object branch.
+      CE loss with temperature T=30 has effective gradient ∝ T × weight,
+      because the logits are scaled by T before softmax, amplifying gradients
+      by T on the backward pass. Other losses (intra, ortho, invariance) have
+      no temperature scaling — their gradient is just weight × loss_gradient.
+
+      This means a naive reading of the weights is misleading:
+        w_object=1.0, T=30  → effective gradient scale = 1.0 × 30 = 30
+        w_intra=2.5,  T=1   → effective gradient scale = 2.5 × 1  = 2.5
+      CE is actually 12× stronger than intra-class, not 0.4× weaker as weights suggest.
+
+    WHAT IT CHECKS:
+      - CE vs Intra-Class ratio (Bug #13: CE overpowering intra-class)
+      - Barlow Ortho dominance (can suppress all other signals)
+      - CLIP cosim health (is the appearance branch actually aligning?)
+      - DANN adversary effectiveness (is subject info being stripped?)
+    """
+    # ── Average raw losses ───────────────────────────────────────────────────
+    l1_avg       = l1_sum        / n_batches
+    l_subj_avg   = l_subj_ce_sum / n_batches
+    l2_avg       = l2_sum        / n_batches
+    l3_avg       = l3_sum        / n_batches if clip_active else 0.0
+    l_ortho_avg  = l_ortho_sum   / n_batches
+    l_intra_avg  = l_intra_sum   / n_batches
+    l_adv_avg    = l_adv_sum     / n_batches
+
+    # ── Effective gradient scale = weight × T_factor × avg_loss ─────────────
+    # CE-based losses have their logits scaled by T=30, so backward gradients
+    # are amplified by T. Non-CE losses have T_factor=1.
+    eff_obj    = w_object  * T * l1_avg       # Object CE    (T-scaled)
+    eff_subj   = w_subject * T * l_subj_avg   # Subject CE   (T-scaled)
+    eff_inv    = w_subject *     l2_avg        # Subj Invar.  (no T)
+    eff_clip   = w_clip    *     l3_avg        # CLIP InfoNCE (no T)
+    eff_ortho  = w_ortho   *     l_ortho_avg   # Barlow Ortho (no T)
+    eff_intra  = w_intra   *     l_intra_avg   # Intra-Class  (no T)
+    eff_adv    = w_adv     * T * l_adv_avg     # Adversary CE (T-scaled)
+
+    total_eff  = eff_obj + eff_subj + eff_inv + eff_clip + eff_ortho + eff_intra + eff_adv
+    if total_eff < 1e-8:
+        return  # nothing to report
+
+    def pct(x): return 100 * x / total_eff
+
+    # ── Print table ─────────────────────────────────────────────────────────
+    W = 58
+    print(f"\n  {'─'*W}")
+    print(f"  LOSS BALANCE REPORT  (Epoch {epoch})")
+    print(f"  Key: Eff.Grad = weight × T_factor × avg_loss")
+    print(f"  {'─'*W}")
+    print(f"  {'Loss':<22} {'RawAvg':>7} {'W':>5} {'T':>4} {'Eff.Grad':>9} {'%':>6}")
+    print(f"  {'─'*W}")
+    print(f"  {'Object CE':<22} {l1_avg:>7.4f} {w_object:>5.1f} {T:>4d} {eff_obj:>9.2f} {pct(eff_obj):>5.1f}%")
+    print(f"  {'Subject CE':<22} {l_subj_avg:>7.4f} {w_subject:>5.1f} {T:>4d} {eff_subj:>9.2f} {pct(eff_subj):>5.1f}%")
+    print(f"  {'Subj Invariance':<22} {l2_avg:>7.4f} {w_subject:>5.1f} {'1':>4} {eff_inv:>9.2f} {pct(eff_inv):>5.1f}%")
+    clip_raw = f"{l3_avg:.4f}" if clip_active else "  OFF"
+    print(f"  {'CLIP InfoNCE':<22} {clip_raw:>7} {w_clip:>5.1f} {'1':>4} {eff_clip:>9.2f} {pct(eff_clip):>5.1f}%")
+    print(f"  {'Barlow Ortho':<22} {l_ortho_avg:>7.4f} {w_ortho:>5.1f} {'1':>4} {eff_ortho:>9.2f} {pct(eff_ortho):>5.1f}%")
+    print(f"  {'Intra-Class':<22} {l_intra_avg:>7.4f} {w_intra:>5.1f} {'1':>4} {eff_intra:>9.2f} {pct(eff_intra):>5.1f}%")
+    print(f"  {'Adversary CE':<22} {l_adv_avg:>7.4f} {w_adv:>5.1f} {T:>4d} {eff_adv:>9.2f} {pct(eff_adv):>5.1f}%")
+    print(f"  {'─'*W}")
+    print(f"  Total Eff. Gradient Budget: {total_eff:.2f}")
+
+    # ── Health checks ────────────────────────────────────────────────────────
+    issues = []
+
+    # Check 1: CE vs Intra-Class (Bug #13)
+    if eff_intra > 1e-6:
+        ce_intra_ratio = eff_obj / eff_intra
+        if ce_intra_ratio > 8:
+            issues.append(
+                f"  ⚠  [BUG-13] CE/Intra ratio = {ce_intra_ratio:.1f}×  "
+                f"(intra-class has only {pct(eff_intra):.1f}% influence — nearly silent).\n"
+                f"     Fix options: raise w_intra above {w_intra} OR reduce T below {T}."
+            )
+        elif ce_intra_ratio > 4:
+            issues.append(
+                f"  ℹ  CE/Intra ratio = {ce_intra_ratio:.1f}×  "
+                f"(intra-class is weak at {pct(eff_intra):.1f}% — monitor generalization)."
+            )
+
+    # Check 2: Barlow Ortho dominance
+    if pct(eff_ortho) > 45:
+        issues.append(
+            f"  ⚠  Barlow Ortho uses {pct(eff_ortho):.0f}% of gradient budget — may suppress other signals.\n"
+            f"     Consider reducing w_ortho below {w_ortho}."
+        )
+
+    # Check 3: CLIP cosine similarity health
+    if clip_active:
+        if avg_cosim < 0.02 and epoch > 30:
+            issues.append(
+                f"  ⚠  CLIP cosim = {avg_cosim:.4f} (near zero after epoch {epoch}).\n"
+                f"     Check: CLIP cache loaded correctly, appearance_dim=768, ViT-L/14 model."
+            )
+        elif avg_cosim < 0.10 and epoch > 100:
+            issues.append(
+                f"  ℹ  CLIP cosim = {avg_cosim:.4f} (low after epoch {epoch}).\n"
+                f"     Appearance branch may be struggling — verify CLIP targets are correct."
+            )
+
+    # Check 4: Adversary too weak to strip subject identity
+    if pct(eff_adv) < 2.0:
+        issues.append(
+            f"  ℹ  Adversary contributes only {pct(eff_adv):.1f}% — may not strip subject identity effectively."
+        )
+
+    # Check 5: Any loss collapsed to near-zero
+    # Use abs(): negative values (pull > push) are ACTIVE, not collapsed.
+    collapsed = []
+    if abs(l_intra_avg)  < 0.001:  collapsed.append("Intra-Class")
+    if abs(l2_avg)       < 0.001:  collapsed.append("Subj-Invariance")
+    if abs(l_ortho_avg)  < 0.001:  collapsed.append("Barlow-Ortho")
+    if collapsed:
+        issues.append(
+            f"  ⚠  Collapsed losses (value ≈ 0): {', '.join(collapsed)}.\n"
+            f"     These losses are contributing nothing — check if valid pairs exist in batch."
+        )
+
+    print()
+    if not issues:
+        print(f"  ✅ Loss balance looks healthy — no major imbalances detected.")
+    else:
+        for issue in issues:
+            print(issue)
+    print(f"  {'─'*W}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -575,9 +841,10 @@ def train(
     image_dir:      str   = "data/image",
     checkpoint_dir: str   = "checkpoints/phase06",
     num_epochs:     int   = 500,
-    clip_patience:  int   = 40,    # silence CLIP after this many epochs without improvement
+    clip_patience:  int   = 40,    # epochs of no CLIP improvement before logging a WARNING
+                                    # (CLIP is never silenced — this only triggers a log message)
     clip_threshold: float = 0.001, # minimum cosine similarity gain to count as improvement
-    clip_warmup_epochs: int = 50,  # epochs before CLIP plateau checking starts
+    clip_warmup_epochs: int = 50,  # epochs before CLIP plateau monitoring starts
     lr:               float = 1e-4,
     weight_decay:     float = 0.01,  # Set to 0.01 to allow visual categories learning
     w_object:         float = 1.0,
@@ -586,18 +853,22 @@ def train(
     w_ortho:          float = 15.0,  # Barlow cross-correlation orthogonality loss
     w_intra:          float = 2.5,   # Reduced to 2.5 to allow cluster slack for unseen visual stimuli
     w_adv:            float = 1.0,   # Weight of the Subject-Adversarial (DANN) loss
-    appearance_dim:   int   = 512,
-    token_dim:        int   = 224, # Increased to 224 (80% params scaling)
-    num_heads:        int   = 4,   # 4 heads (each head = 56-dim)
-    ff_dim:           int   = 416, # Increased to 416 (80% params scaling)
-    num_layers:       int   = 2,   # 2 layers for noise filtering depth
-    dropout:          float = 0.32, # Increased to 0.32 to match larger capacity
+    appearance_dim:   int   = 768,   # ViT-L/14 image embedding (768-dim, must match Phase 7 + SD)
+    token_dim:        int   = 192,  # 3 heads × 64-dim = 192 (reduced capacity to prevent overfit)
+    num_heads:        int   = 3,    # 3 heads × 64-dim per head (standard head size, fewer params)
+    ff_dim:           int   = 384,  # 2× token_dim feed-forward expansion (384 = 2×192)
+    num_layers:       int   = 2,    # 2 layers for noise filtering depth
+    dropout:          float = 0.32, # BranchMLP dropout (separation branches, 1 pass each)
+    transformer_dropout: float = 0.10, # Bug #21 fix: Transformer gets lighter dropout
+                                       # (4 internal passes: 2 per layer × 2 layers)
+                                       # 0.32 in Transformer: (0.68)^4=0.214 → 79% destroyed
+                                       # 0.10 in Transformer: (0.90)^4=0.656 → 34% destroyed
     save_every:       int   = 10,
     log_every:        int   = 50,
     # ── EEG Augmentation ──────────────────────────────────────────────────
-    aug_noise_std:        float = 0.09,  # Increased to 0.09 to match larger capacity
-    aug_channel_drop_p:   float = 0.10,  # Restored to 0.10
-    aug_time_shift_max:   int   = 8,     # Increased to 8 to prevent visual instance memorization
+    aug_noise_std:        float = 0.09,
+    aug_channel_drop_p:   float = 0.10,
+    aug_time_shift_max:   int   = 8,
 ):
     """Train the full EEG pipeline (Phases 3+4+5) with 3 loss functions."""
 
@@ -639,6 +910,7 @@ def train(
         ff_dim=ff_dim,
         num_layers=num_layers,
         dropout=dropout,
+        transformer_dropout=transformer_dropout,   # Bug #21 fix
         appearance_dim=appearance_dim,
     ).to(device)
     ce_loss = nn.CrossEntropyLoss()
@@ -646,10 +918,15 @@ def train(
     # Training-only classification heads:
     # 1. Object: latent [B,128] → class logits [B,72]
     # 2. Subject: latent [B,64]  → subject logits [B,12]
-    # 3. Subject Adversary (DANN): latent [B,128] → subject logits [B,12]
-    obj_classifier  = nn.Linear(128, len(cat_index), bias=False).to(device)
-    subj_classifier = nn.Linear(64, len(subj_index), bias=False).to(device)
-    subj_adversary  = nn.Linear(128, len(subj_index), bias=False).to(device)
+    # 3. Subject Adversary (DANN): shared token rep [B,token_dim=192] → subject logits [B,12]
+    #    Bug fix: adversary now sees the SHARED transformer output (before separation),
+    #    not the object latent (after separation). This means:
+    #      - Adversary has full access to the shared representation (192-dim vs 128-dim)
+    #      - GRL gradient flows into ALL branches via the shared Transformer and Encoder,
+    #        not just through the object branch pathway.
+    obj_classifier  = nn.Linear(128,       len(cat_index),  bias=False).to(device)
+    subj_classifier = nn.Linear(64,        len(subj_index), bias=False).to(device)
+    subj_adversary  = nn.Linear(token_dim, len(subj_index), bias=False).to(device)
 
     optimizer = AdamW(
         list(model.parameters()) 
@@ -687,20 +964,28 @@ def train(
 
     print(f"\n{'='*60}")
     print(f"  PHASE 6 — TRAINING START")
-    print(f"  Epochs   : {num_epochs}  (CLIP auto-silenced on plateau)")
+    print(f"  Epochs   : {num_epochs}  (CLIP always active — plateau logged as warning only)")
     print(f"  Params   : {total_params:,}")
-    print(f"  Losses   : Object-CE(w={w_object}) + Subject(w={w_subject}) + CLIP(w={w_clip} until plateau) + Barlow Ortho(w={w_ortho}) + SubjAdv(w={w_adv})")
+    print(f"  Losses   : Object-CE(w={w_object}) + Subject(w={w_subject}) + CLIP(w={w_clip}) + Barlow Ortho(w={w_ortho}) + SubjAdv(w={w_adv})")
     print(f"  CLIP patience : {clip_patience} epochs  |  threshold : {clip_threshold}  |  warmup : {clip_warmup_epochs} epochs")
     print(f"  LR: {lr}")
     print(f"{'='*60}\n")
 
 
-     # ── CLIP plateau tracking ──────────────────────────────────────────────────
-    # Tracks cosine similarity (not loss) — higher is better.
+    # ── CLIP plateau monitoring ────────────────────────────────────────────────
+    # CLIP is NEVER silenced — it stays active for the full training.
+    # Bug #11 fix: the old code permanently set clip_active=False when cosine
+    # similarity plateaued. This left the appearance branch with zero pull signal
+    # for the rest of training, causing it to drift as the Barlow loss pushed it
+    # away from other improving branches.
+    #
+    # The plateau was caused by upstream bugs (τ=0.07, false negatives, ViT-B/32)
+    # that are now fixed. With those fixed, CLIP alignment should genuinely improve.
+    # If it still plateaus, log a WARNING so the user can investigate — but never kill it.
     clip_active       = use_clip and clip_cache is not None
     best_clip_cosim   = -float("inf")   # best cosine similarity seen so far
     clip_no_improve   = 0               # consecutive epochs without improvement
-    clip_stopped_ep   = None            # epoch at which CLIP was silenced
+    clip_warned       = False           # whether plateau warning has been printed
 
     best_loss = float("inf")
     best_test_acc = 0.0
@@ -734,15 +1019,32 @@ def train(
             # ── Forward ───────────────────────────────────────────────────────
             latents = model(eeg)
 
-            # ── Loss 1: Object Classification (Normalized Softmax ×30) ──────────
-            w_norm     = F.normalize(obj_classifier.weight, dim=1)   # [72, 128]
-            obj_logits = latents["object"] @ w_norm.T * 30.0         # [B, 72]
-            l1 = ce_loss(obj_logits, cat_t)
+            # ── Loss 1: Object Classification (Normalized Softmax ×30) ──────────────
+            # Manifold Mixup intentionally disabled (alpha_mixup=0.0):
+            # Was tried with alpha=0.2/0.4 but made no positive contribution
+            # to training on this EEG dataset. Kept as dead code for reference.
+            alpha_mixup = 0.0
+            if alpha_mixup > 0.0 and model.training:
+                lam = np.random.beta(alpha_mixup, alpha_mixup)
+                rand_idx = torch.randperm(latents["object"].size(0), device=device)
+                mixed_obj = lam * latents["object"] + (1 - lam) * latents["object"][rand_idx]
+                w_norm = F.normalize(obj_classifier.weight, dim=1)
+                obj_logits = mixed_obj @ w_norm.T * 30.0
+                l1 = lam * ce_loss(obj_logits, cat_t) + (1 - lam) * ce_loss(obj_logits, cat_t[rand_idx])
+            else:
+                w_norm = F.normalize(obj_classifier.weight, dim=1)
+                obj_logits = latents["object"] @ w_norm.T * 7.0   # T=7 (was 30 — T=30 allows stable collapse where InterSim=0.948 satisfies CE)
+                l1 = ce_loss(obj_logits, cat_t)
 
-            # ── Loss 2: Subject Classification (Normalized Softmax ×30) ──────────
-            # Force Subject branch to learn a stable representation of subject identity
+            # ── Loss 2: Subject Classification (Normalized Softmax ×7) ──────────
+            # DETACH subject latent: prevents Subject CE gradient from flowing
+            # back through the shared transformer. Without detach, Subject CE
+            # trains the shared transformer to encode subject identity 50× more
+            # strongly than the DANN reversal at early epochs (alpha ramps slowly).
+            # With detach: gradient only updates subj_classifier.weight (head only).
+            # The subject branch MLP is trained by subject_invariance_loss (l2).
             w_subj_norm = F.normalize(subj_classifier.weight, dim=1)  # [12, 64]
-            subj_logits = latents["subject"] @ w_subj_norm.T * 30.0    # [B, 12]
+            subj_logits = latents["subject"].detach() @ w_subj_norm.T * 7.0   # [B, 12]
             l_subj_ce   = ce_loss(subj_logits, subj_t)
 
             # ── Loss 3: Subject Invariance (Object + Subject branches) ─────────
@@ -778,15 +1080,24 @@ def train(
                 latents["object"], cat_t, list(labels)
             )
 
-            # ── Loss 7: Subject-Adversarial Loss (Strip subject from Object branch) ──
-            # Alpha increases linearly over first 100 epochs to 1.0, then remains 1.0
-            alpha_adv = min(1.0, epoch / 100.0)
-            subj_adv_logits = subj_adversary(grad_reverse(latents["object"], alpha_adv))
+            # ── Loss 7: Subject-Adversarial Loss (DANN on SHARED representation) ──
+            # Ramp over first 20 epochs (was 100 — too slow to counteract subject CE
+            # hijacking in early training). At epoch 20, alpha=1.0 and DANN is at
+            # full strength before the shared transformer gets locked into subject identity.
+            alpha_adv = min(1.0, epoch / 20.0)
+            subj_adv_logits = subj_adversary(grad_reverse(latents["shared"], alpha_adv))
             l_adv = ce_loss(subj_adv_logits, subj_t)
 
             # ── Total loss ────────────────────────────────────────────────────
             # w_subject weights both the Subject Invariance (l2) and Subject classification (l_subj_ce)
-            loss = w_object * l1 + w_subject * (l_subj_ce + l2) + current_w_clip * l3 + w_ortho * l_ortho + w_intra * l_intra + w_adv * l_adv
+            loss = (
+                w_object * l1 
+                + w_subject * (l_subj_ce + l2) 
+                + current_w_clip * l3 
+                + w_ortho * l_ortho 
+                + w_intra * l_intra 
+                + w_adv * l_adv
+            )
 
             # ── Backward ──────────────────────────────────────────────────────
             optimizer.zero_grad()
@@ -824,7 +1135,7 @@ def train(
         avg = epoch_loss / n_batches
         elapsed = time.time() - t0
         avg_cosim = l3_cosim_sum / n_batches if clip_active else 0.0
-        clip_status = f"cosim={avg_cosim:.4f}" if clip_active else f"OFF (ep{clip_stopped_ep})"
+        clip_status = f"cosim={avg_cosim:.4f}" if clip_active else "DISABLED"
 
         print(
             f"Epoch {epoch:3d}/{num_epochs} | "
@@ -839,21 +1150,45 @@ def train(
             f"[{elapsed:.1f}s]"
         )
 
-        # ── CLIP plateau check ─────────────────────────────────────────────
+        # ── Loss Balance Report (every 10 epochs) ────────────────────────────
+        if epoch % 10 == 0 or epoch == 1:
+            log_loss_balance(
+                epoch        = epoch,
+                n_batches    = n_batches,
+                l1_sum       = l1_sum,
+                l_subj_ce_sum= l_subj_ce_sum,
+                l2_sum       = l2_sum,
+                l3_sum       = l3_sum,
+                l_ortho_sum  = l_ortho_sum,
+                l_intra_sum  = l_intra_sum,
+                l_adv_sum    = l_adv_sum,
+                w_object     = w_object,
+                w_subject    = w_subject,
+                w_clip       = w_clip,
+                w_ortho      = w_ortho,
+                w_intra      = w_intra,
+                w_adv        = w_adv,
+                clip_active  = clip_active,
+                avg_cosim    = avg_cosim,
+                T            = 7,    # must match the actual T used above
+            )
+
+        # ── CLIP plateau monitor (warning only — CLIP is never silenced) ──────
         if clip_active:
             if avg_cosim - best_clip_cosim > clip_threshold:
                 best_clip_cosim = avg_cosim
                 clip_no_improve  = 0
+                clip_warned      = False   # reset warning if improvement resumes
             else:
                 if epoch > clip_warmup_epochs:
                     clip_no_improve += 1
-                    if clip_no_improve >= clip_patience:
-                        clip_active     = False
-                        clip_stopped_ep = epoch
+                    if clip_no_improve >= clip_patience and not clip_warned:
+                        clip_warned = True
                         print(
-                            f"  [CLIP Silence] CLIP loss plateaued at epoch {epoch} "
-                            f"(cosim={best_clip_cosim:.4f}, no gain for {clip_patience} epochs). "
-                            f"Silencing CLIP — SupCon+Subject continue."
+                            f"  [CLIP WARNING] Cosine similarity has not improved for "
+                            f"{clip_patience} epochs (best={best_clip_cosim:.4f}). "
+                            f"CLIP loss remains ACTIVE. Check: temperature, CLIP cache, "
+                            f"or consider reducing w_clip if appearance branch is collapsing."
                         )
 
         # ── Save best train loss model ───────────────────────────────────────
@@ -934,11 +1269,11 @@ if __name__ == "__main__":
         w_clip         = 0.5,
         w_ortho        = 15.0,  # Barlow cross-correlation orthogonality loss
         w_intra        = 2.5,   # Reduced to 2.5 to allow cluster slack for unseen visual stimuli
-        w_adv          = 1.0,   # Subject-Adversarial (DANN) weight
-        appearance_dim = 512,
-        token_dim      = 224,   # 80% parameter scaling
-        num_heads      = 4,     # 4 heads (each head = 56-dim)
-        ff_dim         = 416,   # 80% parameter scaling
+        w_adv          = 0.1,   # DANN adversary weight — reduced from 1.0 to 0.1.
+        appearance_dim = 768,   # ViT-L/14 image embedding dim
+        token_dim      = 192,   # 3 heads × 64-dim = 192 (reduced capacity to prevent overfit)
+        num_heads      = 3,     # 3 heads × 64-dim per head (standard head size)
+        ff_dim         = 384,   # 2× token_dim feed-forward expansion
         num_layers     = 2,     # 2 layers for noise filtering depth
         dropout        = 0.32,  # Increased to 0.32 to match larger capacity
         aug_noise_std  = 0.09,  # Increased to 0.09 to match larger capacity
